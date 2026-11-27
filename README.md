@@ -18,7 +18,7 @@
 
 ---
 
-## 🤖 支持的 AI 智能体（10 款）
+## 🤖 支持的 AI 智能体（15 款）
 
 | ID | 名称 | CLI | 厂商 | 配额获取方式 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -32,6 +32,15 @@
 | `kimi` | **Kimi Code** | `kimi` | Moonshot | 读取 `~/.kimi-code/credentials/` 或 `KIMI_API_KEY`，调用 `api.kimi.com/coding/v1/usages` |
 | `gemini` | **Gemini CLI** | `gemini` | Google | 读取 `~/.gemini/oauth_creds.json`，调用 `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
 | `cursor` | **Cursor** | `cursor` | Anysphere | 读取 Cursor 本地 `state.vscdb` 中的登录态，调用 `cursor.com/api/usage-summary` |
+| `freebuff` | **Freebuff** | `freebuff` | Codebuff | 读取 Keychain (`freebuff-cli`) 或 `CODEBUFF_API_KEY`，调用 `www.codebuff.com/api/v1/usage` |
+| `kiro` | **Amazon Kiro** | `kiro` | AWS | 读取 `kiro-cli/data.sqlite3`（支持 OIDC 自动刷新），调用 `q.<region>.amazonaws.com/getUsageLimits` |
+| `glm` | **GLM Coding Plan** | `glm` | Zhipu / Z.AI | 读取 `Z_AI_API_KEY`、`~/.config/glm-acp-agent/credentials.json` 或 `~/.claude/settings.json`，调用 `/api/monitor/usage/quota/limit` |
+| `deepseek` | **DeepSeek** | `deepseek` | DeepSeek | 读取 `DEEPSEEK_API_KEY` 或 OpenCode/本地配置，调用 `api.deepseek.com/user/balance` |
+| `openrouter` | **OpenRouter** | `openrouter` | OpenRouter | 读取 `OPENROUTER_API_KEY` 或 OpenCode/本地配置，调用 `openrouter.ai/api/v1/credits` |
+
+> **说明（为何暂不包含部分消费端/强加密桌面应用）：**
+> - **Muse (`com.meta.endo`) / 豆包工作 (`DoubaoWork`)**：消费级 / Chromium WebView 套壳应用，未暴露可查询的用户额度接口。
+> - **Grok Bot (`com.anysphere.sand`) / WorkBuddy & WorkBuddyPro**：本地凭据分别使用 Electron `safeStorage`（macOS 钥匙串强权限隔离）或 `$wbEncrypted` AES-256-GCM 封装；出于安全与隐私合规原则，本项目不绕过系统钥匙串权限或解密应用专属保险库。
 
 ---
 
@@ -73,7 +82,7 @@ python3 collector/quota_collector.py
 # 仅采集指定智能体
 python3 collector/quota_collector.py --providers agy,droid,grok,amp,codex,copilot
 
-# 强制采集全部 10 个智能体
+# 强制采集全部 15 个智能体
 python3 collector/quota_collector.py --all
 ```
 

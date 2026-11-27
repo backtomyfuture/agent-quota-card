@@ -74,6 +74,14 @@ def http_json(
             text=True,
             timeout=timeout + 3,
         )
+        if res.returncode in (35, 56):
+            res = subprocess.run(
+                [curl_bin, "--http1.1", "-K", "-"],
+                input="\n".join(cfg_lines),
+                capture_output=True,
+                text=True,
+                timeout=timeout + 3,
+            )
         if res.returncode != 0:
             raise RuntimeError((res.stderr or f"curl exited {res.returncode}").strip())
         out = res.stdout
@@ -120,6 +128,15 @@ def _keychain_has(service: str, account: str | None = None) -> bool:
         cmd += ["-a", account]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
     return res.returncode == 0
+
+
+def _has_bin(name: str) -> bool:
+    return bool(
+        shutil.which(name)
+        or os.path.exists(f"/opt/homebrew/bin/{name}")
+        or os.path.exists(f"/usr/local/bin/{name}")
+        or (HOME / ".local" / "bin" / name).exists()
+    )
 
 
 def _err_card(pid: str, name: str, cli: str, msg: str) -> dict[str, Any]:
@@ -1206,6 +1223,492 @@ def fetch_cursor() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 11. Freebuff / Codebuff (freebuff)
+# ---------------------------------------------------------------------------
+
+def _freebuff_read_token() -> str | None:
+    env_tok = os.environ.get("CODEBUFF_API_KEY") or os.environ.get("FREEBUFF_API_KEY")
+    if env_tok and env_tok.strip():
+        return env_tok.strip()
+    res = subprocess.run(
+        ["security", "find-generic-password", "-s", "freebuff-cli", "-w"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    return None
+
+
+def detect_freebuff() -> bool:
+    return bool(
+        os.environ.get("CODEBUFF_API_KEY")
+        or os.environ.get("FREEBUFF_API_KEY")
+        or _has_bin("freebuff")
+        or _has_bin("codebuff")
+        or (HOME / ".config" / "freebuff-desktop").exists()
+        or _keychain_has("freebuff-cli")
+    )
+
+
+def fetch_freebuff() -> dict[str, Any]:
+    try:
+        tok = _freebuff_read_token()
+        if not tok:
+            raise RuntimeError("未找到 Freebuff/Codebuff 凭据，请先运行 freebuff login")
+        status, body = http_json(
+            "https://www.codebuff.com/api/v1/usage",
+            method="POST",
+            headers={"Authorization": f"Bearer {tok}", "Accept": "application/json"},
+            json_body={"authToken": tok, "fingerprintId": "freebuff-cli"},
+        )
+        if status != 200 or not isinstance(body, dict):
+            raise RuntimeError(f"API HTTP {status}")
+
+        usage = float(body.get("usage") or 0.0)
+        rem_bal = float(body.get("remainingBalance") or 0.0)
+        total = usage + rem_bal
+        reset_at = body.get("next_quota_reset")
+        breakdown = body.get("balanceBreakdown") or {}
+        sub_bal = float(breakdown.get("subscription") or 0.0)
+        free_bal = float(breakdown.get("free") or 0.0)
+
+        items: list[dict[str, Any]] = []
+        if total > 0:
+            rem_pct = max(0.0, round(rem_bal / total * 100.0, 1))
+            items.append(
+                {
+                    "label": "Credits",
+                    "remaining_percent": rem_pct,
+                    "used_percent": round(100.0 - rem_pct, 1),
+                    "reset_at": reset_at,
+                    "detail": f"余 {rem_bal:g} / 共 {total:g}",
+                }
+            )
+        else:
+            items.append(
+                {
+                    "label": "Freebuff Credits",
+                    "remaining_percent": None,
+                    "used_percent": None,
+                    "reset_at": reset_at,
+                    "detail": f"已用 {usage:g} · 余 {rem_bal:g}",
+                }
+            )
+        if sub_bal > 0 or free_bal > 0:
+            items.append(
+                {
+                    "label": "Breakdown",
+                    "remaining_percent": None,
+                    "used_percent": None,
+                    "reset_at": None,
+                    "detail": f"Free {free_bal:g} · Sub {sub_bal:g}",
+                }
+            )
+        subtitle = "Auto Top-up" if body.get("autoTopupEnabled") else "Codebuff"
+        return _ok_card("freebuff", "Freebuff", "freebuff", subtitle, items)
+    except Exception as exc:
+        return _err_card("freebuff", "Freebuff", "freebuff", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 12. Amazon Kiro (kiro)
+# ---------------------------------------------------------------------------
+
+def _kiro_db_path() -> Path:
+    return HOME / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3"
+
+
+def _kiro_read_state() -> dict[str, Any]:
+    db = _kiro_db_path()
+    if not db.exists():
+        return {}
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        out: dict[str, Any] = {}
+        for table, keys in [
+            ("auth_kv", ["kirocli:odic:token", "kirocli:odic:device-registration"]),
+            ("state", ["api.codewhisperer.profile", "auth.idc.region"]),
+        ]:
+            for key in keys:
+                row = conn.execute(f"SELECT value FROM {table} WHERE key = ?", (key,)).fetchone()
+                if row and row[0] is not None:
+                    try:
+                        out[key] = json.loads(row[0])
+                    except Exception:
+                        out[key] = row[0]
+        return out
+    finally:
+        conn.close()
+
+
+def _kiro_refresh_oidc(region: str, tok: dict[str, Any], reg: dict[str, Any]) -> str | None:
+    if not (tok.get("refresh_token") and reg.get("client_id") and reg.get("client_secret")):
+        return None
+    status, body = http_json(
+        f"https://oidc.{region}.amazonaws.com/token",
+        method="POST",
+        json_body={
+            "clientId": reg["client_id"],
+            "clientSecret": reg["client_secret"],
+            "grantType": "refresh_token",
+            "refreshToken": tok["refresh_token"],
+        },
+    )
+    if status == 200 and isinstance(body, dict) and body.get("accessToken"):
+        return str(body["accessToken"])
+    return None
+
+
+def detect_kiro() -> bool:
+    return bool(_has_bin("kiro-cli") or _kiro_db_path().exists())
+
+
+def fetch_kiro() -> dict[str, Any]:
+    try:
+        state = _kiro_read_state()
+        tok = state.get("kirocli:odic:token")
+        if not isinstance(tok, dict) or not tok.get("access_token"):
+            raise RuntimeError("未找到 Kiro 登录凭据，请先运行 kiro-cli login")
+
+        reg = state.get("kirocli:odic:device-registration") or {}
+        region_raw = state.get("auth.idc.region")
+        region = (
+            region_raw.get("region")
+            if isinstance(region_raw, dict)
+            else (region_raw or tok.get("region") or reg.get("region") or "us-east-1")
+        )
+        profile = state.get("api.codewhisperer.profile") or {}
+        arn = profile.get("arn") or ""
+        profile_name = profile.get("profile_name") or region
+
+        access_tok = str(tok["access_token"])
+        # Refresh proactively if expires_at has passed
+        exp_raw = tok.get("expires_at")
+        expired = False
+        if isinstance(exp_raw, str) and exp_raw:
+            try:
+                exp_dt = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                expired = exp_dt <= datetime.now(timezone.utc)
+            except Exception:
+                pass
+        if expired and isinstance(reg, dict):
+            refreshed = _kiro_refresh_oidc(str(region), tok, reg)
+            if refreshed:
+                access_tok = refreshed
+
+        url = f"https://q.{region}.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+        if arn:
+            url += f"&profileArn={urllib.parse.quote(str(arn), safe='')}"
+        status, body = http_json(url, method="GET", headers={"Authorization": f"Bearer {access_tok}"})
+        if status in (401, 403) and not expired and isinstance(reg, dict):
+            refreshed = _kiro_refresh_oidc(str(region), tok, reg)
+            if refreshed:
+                status, body = http_json(url, method="GET", headers={"Authorization": f"Bearer {refreshed}"})
+
+        if status in (401, 403):
+            raise RuntimeError("Kiro 会话已过期，请运行 kiro-cli login 重新授权")
+        if status != 200 or not isinstance(body, dict):
+            raise RuntimeError(f"API HTTP {status}")
+
+        items: list[dict[str, Any]] = []
+        reset_at = _epoch_to_iso(body.get("nextDateReset"))
+        for entry in body.get("usageBreakdownList") or []:
+            if not isinstance(entry, dict):
+                continue
+            limit = entry.get("usageLimitWithPrecision")
+            if limit is None:
+                limit = entry.get("usageLimit")
+            used = entry.get("currentUsageWithPrecision")
+            if used is None:
+                used = entry.get("currentUsage")
+            lbl = entry.get("displayName") or entry.get("resourceType") or "Usage"
+            entry_reset = _epoch_to_iso(entry.get("nextDateReset")) or reset_at
+            if limit is not None and float(limit) > 0:
+                lim_f = float(limit)
+                used_f = float(used or 0.0)
+                rem_pct = max(0.0, round((1.0 - used_f / lim_f) * 100.0, 1))
+                items.append(
+                    {
+                        "label": str(lbl),
+                        "remaining_percent": rem_pct,
+                        "used_percent": round(100.0 - rem_pct, 1),
+                        "reset_at": entry_reset,
+                        "detail": f"{used_f:g}/{lim_f:g}",
+                    }
+                )
+        sub = (body.get("subscriptionInfo") or {}).get("subscriptionTitle") or str(profile_name)
+        return _ok_card("kiro", "Amazon Kiro", "kiro", sub, items)
+    except Exception as exc:
+        return _err_card("kiro", "Amazon Kiro", "kiro", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 13. GLM Coding Plan / Z.AI (glm)
+# ---------------------------------------------------------------------------
+
+def _read_opencode_auth() -> dict[str, Any]:
+    p = HOME / ".local" / "share" / "opencode" / "auth.json"
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_claude_settings_env() -> dict[str, str]:
+    p = HOME / ".claude" / "settings.json"
+    if not p.exists():
+        return {}
+    try:
+        env = (json.loads(p.read_text(encoding="utf-8")) or {}).get("env") or {}
+        return {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def _glm_resolve_key_and_origin() -> tuple[str | None, str]:
+    # 1. Explicit env var or glm-acp-agent credentials
+    key = os.environ.get("Z_AI_API_KEY") or os.environ.get("ZHIPU_API_KEY")
+    origin = os.environ.get("Z_AI_BASE_URL") or "https://api.z.ai"
+    cred_p = HOME / ".config" / "glm-acp-agent" / "credentials.json"
+    if not key and cred_p.exists():
+        try:
+            key = (json.loads(cred_p.read_text(encoding="utf-8")) or {}).get("z_ai_api_key")
+        except Exception:
+            pass
+    # 2. Claude settings custom bigmodel/z.ai override
+    if not key:
+        cenv = _read_claude_settings_env()
+        base = cenv.get("ANTHROPIC_BASE_URL", "")
+        if any(h in base for h in ("bigmodel.cn", "api.z.ai")) and cenv.get("ANTHROPIC_AUTH_TOKEN"):
+            key = cenv["ANTHROPIC_AUTH_TOKEN"]
+            origin = base
+    # 3. OpenCode auth.json
+    if not key:
+        oc = _read_opencode_auth()
+        for kname, def_org in [("zai-coding-plan", "https://api.z.ai"), ("zai", "https://api.z.ai"), ("zhipuai", "https://open.bigmodel.cn"), ("zhipu", "https://open.bigmodel.cn")]:
+            entry = oc.get(kname)
+            if isinstance(entry, dict) and entry.get("key"):
+                key = str(entry["key"])
+                origin = def_org
+                break
+
+    parsed = urllib.parse.urlparse(origin)
+    host = parsed.hostname or "api.z.ai"
+    if host not in ("api.z.ai", "open.bigmodel.cn", "dev.bigmodel.cn"):
+        host = "open.bigmodel.cn" if "bigmodel" in origin else "api.z.ai"
+    return (key.strip() if key else None), f"https://{host}"
+
+
+def detect_glm() -> bool:
+    key, _ = _glm_resolve_key_and_origin()
+    return bool(key)
+
+
+def fetch_glm() -> dict[str, Any]:
+    try:
+        key, origin = _glm_resolve_key_and_origin()
+        if not key:
+            raise RuntimeError("未找到 Z_AI_API_KEY / ~/.config/glm-acp-agent/credentials.json")
+
+        origins = [origin] + ([o for o in ("https://api.z.ai", "https://open.bigmodel.cn") if o != origin])
+        body: Any = None
+        used_origin = origin
+        last_status = 0
+        for org in origins:
+            st, b = http_json(
+                f"{org}/api/monitor/usage/quota/limit",
+                method="GET",
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            )
+            last_status = st
+            if st == 200 and isinstance(b, dict) and isinstance((b.get("data") or {}).get("limits"), list):
+                body = b
+                used_origin = org
+                break
+        if not isinstance(body, dict):
+            raise RuntimeError(f"API HTTP {last_status}")
+
+        limits = (body.get("data") or {}).get("limits") or []
+        items: list[dict[str, Any]] = []
+        unit_mins = {"3": 60, "4": 1440, "6": 10080}
+        for row in limits:
+            if not isinstance(row, dict):
+                continue
+            rtype = row.get("type")
+            if rtype not in ("CREDIT_LIMIT", "TOKENS_LIMIT", "TIME_LIMIT"):
+                continue
+            used = row.get("currentValue")
+            lim = row.get("usage")
+            pct = row.get("percentage")
+            if pct is None and used is not None and lim:
+                pct = float(used) / float(lim) * 100.0
+            if pct is None:
+                continue
+            used_pct = min(100.0, max(0.0, float(pct)))
+            rem_pct = round(100.0 - used_pct, 1)
+            mins = unit_mins.get(str(row.get("unit")))
+            cnt = row.get("number")
+            dur_lbl = ""
+            if mins and cnt:
+                total_mins = int(mins) * int(cnt)
+                if total_mins % 10080 == 0:
+                    dur_lbl = f"{total_mins // 10080}w "
+                elif total_mins % 1440 == 0:
+                    dur_lbl = f"{total_mins // 1440}d "
+                else:
+                    dur_lbl = f"{max(1, total_mins // 60)}h "
+            lbl = f"{dur_lbl}{'MCP Quota' if rtype == 'TIME_LIMIT' else 'Coding Plan'}"
+            items.append(
+                {
+                    "label": lbl,
+                    "remaining_percent": rem_pct,
+                    "used_percent": round(used_pct, 1),
+                    "reset_at": _epoch_to_iso(row.get("nextResetTime")),
+                    "detail": f"{used}/{lim}" if used is not None and lim is not None else None,
+                }
+            )
+        sub = "open.bigmodel.cn" if "bigmodel" in used_origin else "api.z.ai"
+        return _ok_card("glm", "GLM Coding Plan", "glm", sub, items)
+    except Exception as exc:
+        return _err_card("glm", "GLM Coding Plan", "glm", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 14. DeepSeek API (deepseek)
+# ---------------------------------------------------------------------------
+
+def _deepseek_resolve_key() -> str | None:
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return os.environ["DEEPSEEK_API_KEY"].strip()
+    cenv = _read_claude_settings_env()
+    if "deepseek" in cenv.get("ANTHROPIC_BASE_URL", "").lower() and cenv.get("ANTHROPIC_AUTH_TOKEN"):
+        return cenv["ANTHROPIC_AUTH_TOKEN"].strip()
+    oc = _read_opencode_auth()
+    ds = oc.get("deepseek")
+    if isinstance(ds, dict) and ds.get("key"):
+        return str(ds["key"]).strip()
+    cfg = HOME / ".config" / "deepseek" / "credentials.json"
+    if cfg.exists():
+        try:
+            d = json.loads(cfg.read_text(encoding="utf-8"))
+            if d.get("api_key"):
+                return str(d["api_key"]).strip()
+        except Exception:
+            pass
+    return None
+
+
+def detect_deepseek() -> bool:
+    return bool(_deepseek_resolve_key())
+
+
+def fetch_deepseek() -> dict[str, Any]:
+    try:
+        key = _deepseek_resolve_key()
+        if not key:
+            raise RuntimeError("未配置 DEEPSEEK_API_KEY")
+        status, body = http_json(
+            "https://api.deepseek.com/user/balance",
+            method="GET",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        if status != 200 or not isinstance(body, dict):
+            raise RuntimeError(f"API HTTP {status}")
+
+        items: list[dict[str, Any]] = []
+        for info in body.get("balance_infos") or []:
+            if not isinstance(info, dict):
+                continue
+            cur = info.get("currency") or "USD"
+            sym = "¥" if cur == "CNY" else "$"
+            total_b = info.get("total_balance") or "0"
+            granted_b = info.get("granted_balance")
+            topped_b = info.get("topped_up_balance")
+            parts = []
+            if topped_b is not None:
+                parts.append(f"充值 {sym}{topped_b}")
+            if granted_b is not None:
+                parts.append(f"赠送 {sym}{granted_b}")
+            items.append(
+                {
+                    "label": f"Balance ({cur})",
+                    "remaining_percent": None,
+                    "used_percent": None,
+                    "reset_at": None,
+                    "detail": f"{sym}{total_b}" + (f" ({' · '.join(parts)})" if parts else ""),
+                }
+            )
+        sub = "可用" if body.get("is_available") else "余额不足"
+        return _ok_card("deepseek", "DeepSeek", "deepseek", sub, items)
+    except Exception as exc:
+        return _err_card("deepseek", "DeepSeek", "deepseek", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 15. OpenRouter (openrouter)
+# ---------------------------------------------------------------------------
+
+def _openrouter_resolve_key() -> str | None:
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return os.environ["OPENROUTER_API_KEY"].strip()
+    oc = _read_opencode_auth()
+    entry = oc.get("openrouter")
+    if isinstance(entry, dict) and entry.get("key"):
+        return str(entry["key"]).strip()
+    cfg = HOME / ".config" / "openrouter" / "credentials.json"
+    if cfg.exists():
+        try:
+            d = json.loads(cfg.read_text(encoding="utf-8"))
+            if d.get("api_key"):
+                return str(d["api_key"]).strip()
+        except Exception:
+            pass
+    return None
+
+
+def detect_openrouter() -> bool:
+    return bool(_openrouter_resolve_key())
+
+
+def fetch_openrouter() -> dict[str, Any]:
+    try:
+        key = _openrouter_resolve_key()
+        if not key:
+            raise RuntimeError("未配置 OPENROUTER_API_KEY")
+        status, body = http_json(
+            "https://openrouter.ai/api/v1/credits",
+            method="GET",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        if status != 200 or not isinstance(body, dict) or not isinstance(body.get("data"), dict):
+            raise RuntimeError(f"API HTTP {status}")
+
+        data = body["data"]
+        total = float(data.get("total_credits") or 0.0)
+        used = float(data.get("total_usage") or 0.0)
+        rem = max(0.0, total - used)
+        rem_pct = round(rem / total * 100.0, 1) if total > 0 else None
+        used_pct = round(100.0 - rem_pct, 1) if rem_pct is not None else None
+        items = [
+            {
+                "label": "Credits",
+                "remaining_percent": rem_pct,
+                "used_percent": used_pct,
+                "reset_at": None,
+                "detail": f"${rem:.2f} / ${total:.2f}",
+            }
+        ]
+        return _ok_card("openrouter", "OpenRouter", "openrouter", f"已用 ${used:.2f}", items)
+    except Exception as exc:
+        return _err_card("openrouter", "OpenRouter", "openrouter", str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Registry & CLI
 # ---------------------------------------------------------------------------
 
@@ -1220,6 +1723,11 @@ PROVIDERS: list[dict[str, Any]] = [
     {"id": "kimi", "name": "Kimi Code", "cli": "kimi", "vendor": "Moonshot", "detect": detect_kimi, "fetch": fetch_kimi},
     {"id": "gemini", "name": "Gemini CLI", "cli": "gemini", "vendor": "Google", "detect": detect_gemini, "fetch": fetch_gemini},
     {"id": "cursor", "name": "Cursor", "cli": "cursor", "vendor": "Anysphere", "detect": detect_cursor, "fetch": fetch_cursor},
+    {"id": "freebuff", "name": "Freebuff", "cli": "freebuff", "vendor": "Codebuff", "detect": detect_freebuff, "fetch": fetch_freebuff},
+    {"id": "kiro", "name": "Amazon Kiro", "cli": "kiro", "vendor": "AWS", "detect": detect_kiro, "fetch": fetch_kiro},
+    {"id": "glm", "name": "GLM Coding Plan", "cli": "glm", "vendor": "Zhipu / Z.AI", "detect": detect_glm, "fetch": fetch_glm},
+    {"id": "deepseek", "name": "DeepSeek", "cli": "deepseek", "vendor": "DeepSeek", "detect": detect_deepseek, "fetch": fetch_deepseek},
+    {"id": "openrouter", "name": "OpenRouter", "cli": "openrouter", "vendor": "OpenRouter", "detect": detect_openrouter, "fetch": fetch_openrouter},
 ]
 
 PROVIDER_MAP: dict[str, dict[str, Any]] = {p["id"]: p for p in PROVIDERS}

@@ -383,6 +383,11 @@ func accentForCLI(_ id: String) -> Color {
     case "kimi": return Color(red: 0.30, green: 0.72, blue: 0.96)
     case "gemini": return Color(red: 0.42, green: 0.58, blue: 0.98)
     case "cursor": return Color(red: 0.62, green: 0.68, blue: 0.76)
+    case "freebuff": return Color(red: 0.24, green: 0.82, blue: 0.46)
+    case "kiro": return Color(red: 0.60, green: 0.44, blue: 0.98)
+    case "glm": return Color(red: 0.28, green: 0.68, blue: 0.94)
+    case "deepseek": return Color(red: 0.30, green: 0.52, blue: 1.0)
+    case "openrouter": return Color(red: 0.88, green: 0.42, blue: 0.76)
     default: return .accentColor
     }
 }
