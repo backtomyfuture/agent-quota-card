@@ -1,99 +1,96 @@
-# Agent Quota Card (`AI 限额看板`)
+# AI 限额看板
 
-一款轻量级的 **macOS 原生桌面悬浮卡片 + 顶部菜单栏应用**（SwiftUI + Python），无需反复打开多个终端或进 TUI 敲 `/limits`、`/usage`，即可定时自动刷新并集中查看市面上主流 AI Coding Agent 的剩余额度与重置倒计时。
+桌面上的一张小卡片。它定时查看本机已经登录的 AI 编程工具，还剩多少额度、什么时候重置。
 
----
+下面三张图都是示例数据，用来看界面长什么样。
 
-## ✨ 特性
+![展开后的限额卡片](docs/screenshot-main.png)
 
-- **桌面毛玻璃悬浮小卡片 + 菜单栏联动**
-  - 原生 `swiftc` 编译，无 Electron/浏览器内存开销，`LSUIElement` 无 Dock 图标干扰。
-  - 支持自由拖拽并记住位置，支持 **始终置顶 (`📌`) / 普通层级** 一键切换，支持折叠为紧凑摘要视图 (`⌃/⌄`)。
-  - 顶部菜单栏默认仅显示紧凑图标（鼠标悬停可查看全量明细），支持切换 **「仅图标 / 仅最低项 / 前 3 项」**；左键快速显隐/前置（适配 Stage Manager 台前调度），右键提供快捷菜单。
-- **内置智能体选择配置面板 (`⚙️`)**
-  - 打开卡片内配置面板即可自由勾选要监控的 AI 工具，支持 **「自动检测本机已安装/已登录」**、**「全选」**、**「仅核心 4 个」** 一键筛选。
-  - 可自定义自动刷新周期（`5 / 10 / 15 / 30 / 60 分钟`）。
-- **零 TUI 模拟，直接对接本地凭据与官方接口**
-  - 全程 100% 本地运行，直接复用各 CLI 工具本机已登录的 Keychain / 本地凭据文件请求对应配额接口（并支持 OAuth Token 自动刷新），不上传任何数据到第三方服务器。
+## 安装
 
----
+需要 macOS 13 或更高版本，以及 Xcode 命令行工具（里面有 `swiftc`）。
 
-## 🤖 支持的 AI 智能体（15 款）
-
-| ID | 名称 | CLI | 厂商 | 配额获取方式 |
-| :--- | :--- | :--- | :--- | :--- |
-| `agy` | **Antigravity** | `agy` | Google | 优先读取本机 `LanguageServerService/RetrieveUserQuotaSummary`（Gemini 5h/Weekly + Claude/GPT Weekly）；离线时自动回退云端接口与 Keychain OAuth 刷新 |
-| `droid` | **Factory Droid** | `droid` | Factory | 读取 Keychain + AES-256-GCM 解密 `~/.factory/auth.v2.loginkeychain`，直连 `/api/billing/limits`（5h / Weekly / Monthly / Core / Extra Balance，支持 WorkOS 刷新） |
-| `grok` | **Grok Build** | `grok` | xAI | 读取 `~/.grok/auth.json`，直连 `cli-chat-proxy.grok.com/v1/billing?format=credits`（Weekly/Monthly + On-Demand/Prepaid，支持 OIDC 刷新） |
-| `amp` | **Amp** | `amp` | Sourcegraph | 调用 `amp usage` 并解析 Amp Free 日限额与 Workspace 余额 |
-| `codex` | **OpenAI Codex** | `codex` | OpenAI | 读取 `~/.codex/auth.json`，直连 `chatgpt.com/backend-api/wham/usage`（Rate Limit 窗口、Code Review 与 Credits，支持 OAuth 刷新） |
-| `claude` | **Claude Code** | `claude` | Anthropic | 读取 Keychain (`Claude Code-credentials`) 或 `~/.claude/.credentials.json`，调用 `api.anthropic.com/api/oauth/usage`（5h / 7d 利用率） |
-| `copilot` | **GitHub Copilot** | `copilot` | GitHub | 复用 `gh auth token` 或本地 Copilot OAuth 配置，调用 `api.github.com/copilot_internal/user` 解析 `quota_snapshots` |
-| `kimi` | **Kimi Code** | `kimi` | Moonshot | 读取 `~/.kimi-code/credentials/` 或 `KIMI_API_KEY`，调用 `api.kimi.com/coding/v1/usages` |
-| `gemini` | **Gemini CLI** | `gemini` | Google | 读取 `~/.gemini/oauth_creds.json`，调用 `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
-| `cursor` | **Cursor** | `cursor` | Anysphere | 读取 Cursor 本地 `state.vscdb` 中的登录态，调用 `cursor.com/api/usage-summary` |
-| `freebuff` | **Freebuff** | `freebuff` | Codebuff | 读取 Keychain (`freebuff-cli`) 或 `CODEBUFF_API_KEY`，调用 `www.codebuff.com/api/v1/usage` |
-| `kiro` | **Amazon Kiro** | `kiro` | AWS | 读取 `kiro-cli/data.sqlite3`（支持 OIDC 自动刷新），调用 `q.<region>.amazonaws.com/getUsageLimits` |
-| `glm` | **GLM Coding Plan** | `glm` | Zhipu / Z.AI | 读取 `Z_AI_API_KEY`、`~/.config/glm-acp-agent/credentials.json` 或 `~/.claude/settings.json`，调用 `/api/monitor/usage/quota/limit` |
-| `deepseek` | **DeepSeek** | `deepseek` | DeepSeek | 读取 `DEEPSEEK_API_KEY` 或 OpenCode/本地配置，调用 `api.deepseek.com/user/balance` |
-| `openrouter` | **OpenRouter** | `openrouter` | OpenRouter | 读取 `OPENROUTER_API_KEY` 或 OpenCode/本地配置，调用 `openrouter.ai/api/v1/credits` |
-
-> **说明（为何暂不包含部分消费端/强加密桌面应用）：**
-> - **Muse (`com.meta.endo`) / 豆包工作 (`DoubaoWork`)**：消费级 / Chromium WebView 套壳应用，未暴露可查询的用户额度接口。
-> - **Grok Bot (`com.anysphere.sand`) / WorkBuddy & WorkBuddyPro**：本地凭据分别使用 Electron `safeStorage`（macOS 钥匙串强权限隔离）或 `$wbEncrypted` AES-256-GCM 封装；出于安全与隐私合规原则，本项目不绕过系统钥匙串权限或解密应用专属保险库。
-
----
-
-## 🛠️ 环境要求与安装构建
-
-### 依赖要求
-- macOS 13.0+
-- Xcode Command Line Tools（系统自带 `swiftc` 与 `codesign`）
-- Python 3（仅使用标准库）
-- Node.js（仅在启用 `droid` 且需要 AES-256-GCM 解密 `~/.factory/auth.v2.*` 时使用）
-
-### 一键编译安装
 ```bash
 git clone https://github.com/backtomyfuture/agent-quota-card.git
 cd agent-quota-card
-chmod +x build.sh
-./build.sh
+bash build.sh
 open /Applications/QuotaCard.app
 ```
 
-> 如需构建到其他目录，可传入 `APP_DIR=./dist ./build.sh`。
+装好后，卡片出现在屏幕右上角，菜单栏多一个图标。它不进 Dock。
 
-### 开机自启动
-打开 **系统设置 → 通用 → 登录项**，将 `/Applications/QuotaCard.app` 添加进去即可。
+想开机自己打开：打开 **系统设置 → 通用 → 登录项**，把 QuotaCard 加进去。
 
----
+## 怎么用
 
-## 🧪 单独使用命令行采集器
+卡片可以拖走，位置会记住。顶部按钮从左到右是：
 
-采集脚本 [collector/quota_collector.py](collector/quota_collector.py) 也可单独输出 JSON，方便接入 Raycast、SwiftBar 或其他脚本：
+- **绿点**：空闲。正在刷新时变成橙色。旁边是上次更新的时间。
+- **`15m`**：自动刷新间隔。点一下，在 5、10、15、30、60 分钟之间切换。
+- **滑杆**：选择要监控哪些工具。
+- **刷新**：马上再查一次。
+- **图钉**：蓝色表示一直浮在最前面。再点一次回到普通窗口。
+- **箭头**：收成摘要，或展开每条额度。
+- **关闭**：先把卡片藏起来。菜单栏图标还在，点一下再打开。
+
+收起来以后，每个工具只留一个百分比，取的是它里面最低的那一项。绿色还够用，橙色不多了，红色快用完。
+
+![折叠后的摘要](docs/screenshot-compact.png)
+
+点滑杆可以改监控范围：
+
+![监控配置](docs/screenshot-settings.png)
+
+- **自动检测本机**：只勾选这台电脑上已经安装并登录的工具。
+- **仅核心 4 个**：Antigravity、Factory Droid、Grok、Amp。
+- **全选**：15 个都看。
+
+同一页底部可以改菜单栏：只显示图标、只显示最低的一项，或显示前 3 项。鼠标停在菜单栏图标上，能看到全部。
+
+左键点菜单栏图标，显示或隐藏卡片。右键可以刷新、改频率，或退出。
+
+改完点 **应用并立即刷新**。
+
+## 支持哪些工具
+
+没安装或没登录的会标成「未配置」，可以不选。
+
+| 工具 | 命令 | 能看到 |
+| --- | --- | --- |
+| Antigravity | `agy` | 几小时额度和每周额度 |
+| Factory Droid | `droid` | 几小时、每周，以及额外余额 |
+| Grok Build | `grok` | 每周额度 |
+| Amp | `amp` | 当天免费额度 |
+| OpenAI Codex | `codex` | 用量窗口 |
+| Claude Code | `claude` | 5 小时和 7 天 |
+| GitHub Copilot | `copilot` | 额度快照 |
+| Kimi Code | `kimi` | 用量 |
+| Gemini CLI | `gemini` | 额度 |
+| Cursor | `cursor` | 用量 |
+| Freebuff | `freebuff` | 用量 |
+| Amazon Kiro | `kiro` | 用量上限 |
+| GLM Coding Plan | `glm` | 套餐额度 |
+| DeepSeek | `deepseek` | 余额 |
+| OpenRouter | `openrouter` | 余额 |
+
+查 Factory Droid 时，如果登录信息是加密保存的，电脑上需要有 Node.js。其他工具只用系统自带的 Python 3。
+
+## 只在终端里看
+
+采集脚本也可以单独用，结果是 JSON。
 
 ```bash
-# 查看所有支持的智能体及本机检测状态
-python3 collector/quota_collector.py --catalog
-
-# 自动采集本机已检出的全部智能体
 python3 collector/quota_collector.py
-
-# 仅采集指定智能体
-python3 collector/quota_collector.py --providers agy,droid,grok,amp,codex,copilot
-
-# 强制采集全部 15 个智能体
-python3 collector/quota_collector.py --all
+python3 collector/quota_collector.py --providers agy,droid,grok,amp
 ```
 
----
+- `--catalog`：列出全部工具，并标出这台电脑哪些已经登录。
+- `--all`：不管有没有登录，15 个都查一遍。
 
-## 🔒 隐私与安全
+## 隐私
 
-- 所有凭据仅从你本机的钥匙串（Keychain）或各自 CLI 的标准配置目录读取，仅用于向对应的官方 API 端点查询配额。
-- 请求通过系统 `/usr/bin/curl -K -`（标准输入配置）发送，**Token 不会暴露在进程命令行参数中**。
-- 本项目不包含任何统计上报或远端服务器。
+只读取这些工具已经保存在你电脑上的登录状态，向它们各自的官方接口查询额度。项目没有自己的服务器，也不会把数据发到别处。
 
-## 📄 License
+## License
 
 [MIT](LICENSE)
