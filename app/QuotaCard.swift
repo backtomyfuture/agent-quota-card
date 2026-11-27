@@ -44,6 +44,20 @@ struct CatalogEntry: Codable, Identifiable {
 
 // MARK: - Store
 
+enum MenuBarStyle: String, CaseIterable {
+    case iconOnly = "iconOnly"
+    case lowestOnly = "lowestOnly"
+    case compactThree = "compactThree"
+
+    var label: String {
+        switch self {
+        case .iconOnly: return "仅图标"
+        case .lowestOnly: return "仅最低项"
+        case .compactThree: return "前3项"
+        }
+    }
+}
+
 @MainActor
 final class QuotaStore: ObservableObject {
     @Published var providers: [ProviderQuota] = []
@@ -53,6 +67,11 @@ final class QuotaStore: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var globalError: String?
     @Published var showingSettings: Bool = false
+    @Published var menuBarStyle: MenuBarStyle {
+        didSet {
+            UserDefaults.standard.set(menuBarStyle.rawValue, forKey: "QuotaCard.menuBarStyle")
+        }
+    }
     @Published var isPinned: Bool {
         didSet {
             UserDefaults.standard.set(isPinned, forKey: "QuotaCard.isPinned")
@@ -78,6 +97,12 @@ final class QuotaStore: ObservableObject {
     init() {
         let savedMinutes = UserDefaults.standard.integer(forKey: "QuotaCard.refreshMinutes")
         self.refreshMinutes = savedMinutes > 0 ? savedMinutes : 15
+        if let rawStyle = UserDefaults.standard.string(forKey: "QuotaCard.menuBarStyle"),
+           let style = MenuBarStyle(rawValue: rawStyle) {
+            self.menuBarStyle = style
+        } else {
+            self.menuBarStyle = .iconOnly
+        }
         if UserDefaults.standard.object(forKey: "QuotaCard.isPinned") != nil {
             self.isPinned = UserDefaults.standard.bool(forKey: "QuotaCard.isPinned")
         } else {
@@ -692,7 +717,22 @@ struct QuotaCardView: View {
                 }
                 .padding(.trailing, 2)
             }
-            .frame(maxHeight: 360)
+            .frame(maxHeight: 340)
+
+            HStack(spacing: 6) {
+                Text("状态栏")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
+                ForEach(MenuBarStyle.allCases, id: \.rawValue) { style in
+                    Button(style.label) {
+                        store.menuBarStyle = style
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(store.menuBarStyle == style ? .accentColor : .secondary)
+                    .controlSize(.small)
+                }
+            }
 
             Button {
                 withAnimation(.easeInOut(duration: 0.16)) {
@@ -889,6 +929,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        store.$menuBarStyle
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateMenuBarTitle()
+            }
+            .store(in: &cancellables)
+
         store.$isCollapsed
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -986,8 +1033,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "gauge.with.dots.needle.67percent", accessibilityDescription: "AI 限额看板")
-            button.imagePosition = .imageLeading
-            button.title = " 配额"
+            button.imagePosition = .imageOnly
+            button.title = ""
+            button.toolTip = "AI 限额看板（点击显隐卡片，右键菜单）"
             button.target = self
             button.action = #selector(onStatusBarClick(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -996,20 +1044,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateMenuBarTitle() {
         guard let button = statusItem.button else { return }
+
         if store.providers.isEmpty {
-            button.title = " 配额"
-            return
-        }
-        // Keep status bar concise (show up to 4 items, or all if <=4)
-        let shown = store.providers.prefix(5)
-        let summary = shown.map { p -> String in
-            let tag = String(p.cli.prefix(1)).uppercased()
-            if let minPct = p.items.compactMap(\.remaining_percent).min() {
-                return "\(tag):\(Int(minPct.rounded()))%"
+            button.toolTip = "AI 限额看板（点击显隐卡片，右键菜单）"
+        } else {
+            let tipLines = store.providers.map { p -> String in
+                if let minPct = p.items.compactMap(\.remaining_percent).min() {
+                    return "\(p.name): 剩余 \(Int(minPct.rounded()))%"
+                } else if let detail = p.items.first?.detail {
+                    return "\(p.name): \(detail)"
+                } else if p.status == "error" {
+                    return "\(p.name): 获取失败"
+                }
+                return "\(p.name): --"
             }
-            return "\(tag):--"
-        }.joined(separator: " ")
-        button.title = " " + summary
+            button.toolTip = tipLines.joined(separator: "\n")
+        }
+
+        switch store.menuBarStyle {
+        case .iconOnly:
+            button.imagePosition = .imageOnly
+            button.title = ""
+        case .lowestOnly:
+            let ranked = store.providers.compactMap { p -> (String, Double)? in
+                guard let m = p.items.compactMap(\.remaining_percent).min() else { return nil }
+                return (p.cli, m)
+            }.sorted { $0.1 < $1.1 }
+            if let lowest = ranked.first {
+                button.imagePosition = .imageLeading
+                button.title = " \(lowest.0) \(Int(lowest.1.rounded()))%"
+            } else {
+                button.imagePosition = .imageOnly
+                button.title = ""
+            }
+        case .compactThree:
+            let ranked = store.providers.compactMap { p -> (String, Double)? in
+                guard let m = p.items.compactMap(\.remaining_percent).min() else { return nil }
+                return (p.cli, m)
+            }
+            if ranked.isEmpty {
+                button.imagePosition = .imageOnly
+                button.title = ""
+            } else {
+                let text = ranked.prefix(3).map { "\($0.0) \(Int($0.1.rounded()))%" }.joined(separator: " ")
+                button.imagePosition = .imageLeading
+                button.title = " " + text
+            }
+        }
     }
 
     @objc private func onStatusBarClick(_ sender: Any?) {
@@ -1098,6 +1179,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         intervalParent.submenu = intervalMenu
         menu.addItem(intervalParent)
 
+        let styleMenu = NSMenu()
+        for (idx, style) in MenuBarStyle.allCases.enumerated() {
+            let item = NSMenuItem(title: style.label, action: #selector(menuSetBarStyle(_:)), keyEquivalent: "")
+            item.tag = idx
+            item.state = store.menuBarStyle == style ? .on : .off
+            item.target = self
+            styleMenu.addItem(item)
+        }
+        let styleParent = NSMenuItem(title: "状态栏显示", action: nil, keyEquivalent: "")
+        styleParent.submenu = styleMenu
+        menu.addItem(styleParent)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "重置位置到右上角", action: #selector(menuResetPos), keyEquivalent: ""))
         menu.addItem(.separator())
@@ -1124,6 +1217,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func menuSetInterval(_ sender: NSMenuItem) {
         if sender.tag > 0 {
             store.refreshMinutes = sender.tag
+        }
+    }
+
+    @objc private func menuSetBarStyle(_ sender: NSMenuItem) {
+        let styles = MenuBarStyle.allCases
+        if sender.tag >= 0 && sender.tag < styles.count {
+            store.menuBarStyle = styles[sender.tag]
         }
     }
 
