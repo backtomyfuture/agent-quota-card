@@ -1,0 +1,8 @@
+.DS_Store
+*.app/
+dist/
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
